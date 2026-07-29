@@ -80,11 +80,12 @@ async function fetchIamTokenByPassword({ domain, username, password, region }) {
     let errMsg = `HTTP ${resp.status}`;
     try {
       const j = JSON.parse(txt);
-      errMsg = j.error?.message || j.error?.code || j.error_msg || errMsg;
+      // 华为云 IAM 错误结构: { error: { code, message, ... }, error_code, error_msg }
+      errMsg = j.error?.message || j.error_msg || j.error?.code || j.error_code || errMsg;
     } catch {
-      errMsg = txt.slice(0, 200) || errMsg;
+      errMsg = txt.slice(0, 300) || errMsg;
     }
-    throw new Error(`获取 IAM Token 失败: ${errMsg}`);
+    throw new Error(`获取 IAM Token 失败 (HTTP ${resp.status}): ${errMsg}`);
   }
   const token = resp.headers.get("X-Subject-Token");
   if (!token) {
@@ -96,9 +97,12 @@ async function fetchIamTokenByPassword({ domain, username, password, region }) {
   const accountId = data?.token?.user?.domain?.id || data?.token?.domain?.id || "";
   // 提前 10 分钟续期（保险起见）
   const expiresAtMs = Date.parse(data?.token?.expires_at || "") - 10 * 60 * 1000;
+  const finalExpiresAt = Number.isFinite(expiresAtMs) ? expiresAtMs : Date.now() + 23 * 3600 * 1000;
   return {
     token,
-    expiresAtMs: Number.isFinite(expiresAtMs) ? expiresAtMs : Date.now() + 23 * 3600 * 1000,
+    // 同时返回两个字段名,兼容旧版 KV 中可能残留的 expiresAtMs
+    expiresAtMs: finalExpiresAt,
+    tokenExpiresAt: finalExpiresAt,
     projectId,
     projectName,
     accountId,
@@ -127,7 +131,8 @@ async function loadAuth(env) {
     password: cfg?.password || "",
     region: cfg?.region || env.HUAWEI_REGION || "cn-north-4",
     token: cfg?.token || env.HUAWEI_AUTH_TOKEN || "",
-    tokenExpiresAt: cfg?.tokenExpiresAt || 0,
+    // 兼容旧版 KV 字段名 expiresAtMs
+    tokenExpiresAt: cfg?.tokenExpiresAt || cfg?.expiresAtMs || 0,
     projectId: cfg?.projectId || env.HUAWEI_PROJECT_ID || "",
     projectName: cfg?.projectName || "",
     accountId: cfg?.accountId || "",
@@ -151,7 +156,7 @@ async function saveAuth(env, cfg) {
  */
 async function ensureFreshToken(env) {
   const cfg = await loadAuth(env);
-  // 缺少账号/密码：用户手填 Token 模式，不自动续期
+  // 缺少账号/密码:用户手填 Token 模式,不自动续期
   if (!cfg.domain || !cfg.username || !cfg.password) return cfg;
   const now = Date.now();
   // Token 还有 >= 1h 有效期
@@ -159,14 +164,32 @@ async function ensureFreshToken(env) {
     return cfg;
   }
   // 续期
-  const fresh = await fetchIamTokenByPassword({
-    domain: cfg.domain,
-    username: cfg.username,
-    password: cfg.password,
-    region: cfg.region,
-  });
-  const next = { ...cfg, ...fresh };
-  await saveAuth(env, next);
+  let fresh;
+  try {
+    fresh = await fetchIamTokenByPassword({
+      domain: cfg.domain,
+      username: cfg.username,
+      password: cfg.password,
+      region: cfg.region,
+    });
+  } catch (e) {
+    // 失败时不要清掉旧 token,直接返回旧 cfg,任务会继续尝试(后续接口若 401 再暴露)
+    console.log("[ensureFreshToken] 续期失败:", e.message);
+    return cfg;
+  }
+  // 显式合并:保证 tokenExpiresAt / expiresAtMs 都写入 KV,后续读取不会因字段名而误判过期
+  const next = {
+    ...cfg,
+    ...fresh,
+    token: fresh.token,
+    tokenExpiresAt: fresh.tokenExpiresAt || fresh.expiresAtMs || cfg.tokenExpiresAt,
+    expiresAtMs: fresh.expiresAtMs || fresh.tokenExpiresAt || cfg.tokenExpiresAt,
+  };
+  try {
+    await saveAuth(env, next);
+  } catch (e) {
+    console.log("[ensureFreshToken] 写 KV 失败:", e.message);
+  }
   return next;
 }
 
@@ -1326,7 +1349,7 @@ export default {
           scriptFnv32: fnv,
           hasDynamicReactImport: HTML_PAGE.includes("REACT_PRIMARY"),
           hasCreateRootImport: html.includes("createRoot"),
-          buildId: "2026-07-29-fix-475",
+          buildId: "2026-07-29-token-fetch-fix",
           note: "若 scriptFnv32 与本地 worker.js 计算结果不一致,说明 Cloudflare 部署的是旧版本,请重新粘贴并 Deploy",
         }, null, 2),
         { headers: { "Content-Type": "application/json; charset=utf-8" } }
@@ -1402,27 +1425,35 @@ export default {
       }
     }
 
-    // API: 自动化配置（登录华为云 IAM 拿 Token 并写入 KV）
+    // API: 自动化配置(登录华为云 IAM 拿 Token 并写入 KV)
     // POST { domain, username, password, region }
     if (path === "/api/auto-config" && request.method === "POST") {
-      if (!authorized) return jsonResp({ ok: false, error: "Unauthorized" }, 401);
+      if (!authorized) return jsonResp({ ok: false, error: "Unauthorized (请检查 ADMIN_KEY 是否设置且正确)" }, 401);
       try {
         const body = await request.json().catch(() => ({}));
+        // 只 trim domain/username/region,password 不要 trim 防止删掉有效空格
         const domain = (body.domain || "").trim();
         const username = (body.username || "").trim();
         const password = body.password || "";
         const region = (body.region || "").trim();
-        if (!domain) throw new Error("请填写华为云账号名（domain）");
+        if (!domain) throw new Error("请填写华为云账号名(domain)");
         if (!username) throw new Error("请填写 IAM 用户名");
         if (!password) throw new Error("请填写 IAM 密码");
-        if (!region) throw new Error("请选择 region（区域）");
+        if (!region) throw new Error("请选择 region(区域)");
 
         // 先尝试拉取新 Token 验证账号
-        const fresh = await fetchIamTokenByPassword({ domain, username, password, region });
-        if (!fresh.projectId) {
-          throw new Error("登录成功但未返回 project_id，请确认该 IAM 用户在 " + region + " 区域有权限");
+        let fresh;
+        try {
+          fresh = await fetchIamTokenByPassword({ domain, username, password, region });
+        } catch (iamErr) {
+          // 透传华为云 IAM 真实错误给前端,便于排查
+          console.log("[auto-config] IAM 错误:", iamErr.message);
+          throw iamErr;
         }
-        // 合并：保留旧的 accountId/其他字段，写入新 token
+        if (!fresh.projectId) {
+          throw new Error("登录成功但未返回 project_id,请确认该 IAM 用户在 " + region + " 区域有权限");
+        }
+        // 合并:保留旧的 accountId/其他字段,写入新 token
         const prev = await loadAuth(env);
         const next = {
           ...prev,
@@ -1431,7 +1462,9 @@ export default {
           password,
           region,
           token: fresh.token,
-          tokenExpiresAt: fresh.expiresAtMs,
+          // 同时写两个字段,避免后续 loadAuth 读到旧字段
+          tokenExpiresAt: fresh.tokenExpiresAt || fresh.expiresAtMs,
+          expiresAtMs: fresh.expiresAtMs || fresh.tokenExpiresAt,
           projectId: fresh.projectId,
           projectName: fresh.projectName || prev.projectName || region,
           accountId: fresh.accountId || prev.accountId || "",
@@ -1439,14 +1472,14 @@ export default {
         await saveAuth(env, next);
         return jsonResp({
           ok: true,
-          message: "自动化配置成功！Token 已写入 KV，有效期 " + formatRemain(fresh.expiresAtMs),
+          message: "自动化配置成功!Token 已写入 KV,有效期 " + formatRemain(fresh.tokenExpiresAt || fresh.expiresAtMs),
           config: {
             region,
             projectId: fresh.projectId,
             projectName: next.projectName,
             accountId: next.accountId,
-            tokenExpiresAt: fresh.expiresAtMs,
-            tokenRemainLabel: formatRemain(fresh.expiresAtMs),
+            tokenExpiresAt: fresh.tokenExpiresAt || fresh.expiresAtMs,
+            tokenRemainLabel: formatRemain(fresh.tokenExpiresAt || fresh.expiresAtMs),
           },
         });
       } catch (e) {
@@ -1484,13 +1517,13 @@ export default {
       }
     }
 
-    // API: 强制刷新 Token（不依赖剩余有效期）
+    // API: 强制刷新 Token(不依赖剩余有效期)
     if (path === "/api/refresh-token" && request.method === "POST") {
-      if (!authorized) return jsonResp({ ok: false, error: "Unauthorized" }, 401);
+      if (!authorized) return jsonResp({ ok: false, error: "Unauthorized (请检查 ADMIN_KEY 是否设置且正确)" }, 401);
       try {
         const cfg = await loadAuth(env);
         if (!cfg.domain || !cfg.username || !cfg.password) {
-          throw new Error("未配置账号/密码，无法自动续期。请先点 “自动化配置” 填写。");
+          throw new Error("未配置账号/密码,无法自动续期。请先点 '自动化配置' 填写。");
         }
         const fresh = await fetchIamTokenByPassword({
           domain: cfg.domain,
@@ -1498,12 +1531,19 @@ export default {
           password: cfg.password,
           region: cfg.region,
         });
-        const next = { ...cfg, ...fresh };
+        // 显式合并 tokenExpiresAt 和 expiresAtMs,保证 KV 后续可读
+        const next = {
+          ...cfg,
+          ...fresh,
+          token: fresh.token,
+          tokenExpiresAt: fresh.tokenExpiresAt || fresh.expiresAtMs,
+          expiresAtMs: fresh.expiresAtMs || fresh.tokenExpiresAt,
+        };
         await saveAuth(env, next);
         return jsonResp({
           ok: true,
-          message: "Token 已刷新，" + formatRemain(fresh.expiresAtMs) + " 后过期",
-          tokenRemainLabel: formatRemain(fresh.expiresAtMs),
+          message: "Token 已刷新," + formatRemain(fresh.tokenExpiresAt || fresh.expiresAtMs) + " 后过期",
+          tokenRemainLabel: formatRemain(fresh.tokenExpiresAt || fresh.expiresAtMs),
         });
       } catch (e) {
         return jsonResp({ ok: false, error: e.message }, 500);
