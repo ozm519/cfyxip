@@ -1,0 +1,42 @@
+# 操作系统垃圾文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE / 编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Node 临时文件(本项目其实不用 Node,但万一本机 wrangler 测试会生成)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Cloudflare 临时文件
+.wrangler/
+.dev.vars
+.dev.vars.*
+
+# 环境变量 / 秘钥
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# 日志
+*.log
+logs/
+
+# 备份文件
+*.bak
+*.orig
+*.rej
