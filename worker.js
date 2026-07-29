@@ -501,7 +501,10 @@ const HTML_PAGE = `<!doctype html>
 <div id="root"></div>
 <script type="module">
 // ==================== 自检 + 全局错误捕获 ====================
-// 任何 import / 渲染错误都会写到 #__boot_err,避免白屏看不到原因
+// 只有真正的错误才显示红色 banner;启动进度只打到 console,不影响 UI 美观
+function __bootLog(msg){
+  try{ console.log("[boot]", msg); }catch(_){}
+}
 function __bootErr(msg){
   let el=document.getElementById("__boot_err");
   if(!el){
@@ -510,19 +513,64 @@ function __bootErr(msg){
     el.style.cssText="position:fixed;top:0;left:0;right:0;z-index:99999;background:#fee;border:2px solid #dc2626;color:#7f1d1d;padding:14px 18px;font:13px/1.5 -apple-system,Segoe UI,sans-serif;white-space:pre-wrap;word-break:break-all;";
     document.body && document.body.appendChild(el);
   }
-  el.textContent+=(el.textContent?"\n\n":"")+msg;
+  el.textContent+=(el.textContent?"  ":"")+msg;
 }
-window.addEventListener("error",(e)=>__bootErr("[window.error] "+(e.message||e.error)+"\n"+(e.error?.stack||"")));
+window.addEventListener("error",(e)=>__bootErr("[window.error] "+(e.message||e.error)+"  "+(e.error?.stack||"")));
 window.addEventListener("unhandledrejection",(e)=>__bootErr("[unhandledrejection] "+(e.reason?.message||e.reason)));
-__bootErr("[boot] 正在加载 React...");
+__bootLog("正在加载 React...");
 
-// 通过 esm.sh 在浏览器中加载 React。?dev=false&pin=v135 锁定缓存,避免 esm.sh 改版导致 import 失败
-import React, { useState, useEffect, useMemo } from "https://esm.sh/react@18.3.1?dev=false&pin=v135";
-import { createRoot } from "https://esm.sh/react-dom@18.3.1/client?dev=false&pin=v135&deps=react@18.3.1";
-__bootErr("[boot] React 加载完成,准备渲染...");
+// 用动态 import() 加载 React,失败时回退到备用 CDN,避免 esm.sh 偶发抽风导致 475 行 syntax 错
+const REACT_PRIMARY="https://esm.sh/react@18.3.1?dev=false&pin=v135";
+const REACT_DOM_PRIMARY="https://esm.sh/react-dom@18.3.1/client?dev=false&pin=v135&deps=react@18.3.1";
+const REACT_FALLBACK="https://cdn.jsdelivr.net/npm/react@18.3.1/";
+const REACT_DOM_FALLBACK="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/client.js";
 
+(async()=>{
+  async function tryImport(url, label){
+    try{
+      const m = await import(/* @vite-ignore */ url);
+      __bootLog("✓ " + label + " 加载完成");
+      return m;
+    }catch(e){
+      __bootLog("✗ " + label + " 加载失败: " + (e?.message || e));
+      throw e;
+    }
+  }
+  let ReactMod, DomMod;
+  try{
+    ReactMod = await tryImport(REACT_PRIMARY, "react@esm.sh");
+    DomMod   = await tryImport(REACT_DOM_PRIMARY, "react-dom@esm.sh");
+  }catch(e1){
+    __bootLog("主 CDN 失败,尝试备用 jsdelivr: " + e1?.message);
+    try{
+      ReactMod = await tryImport(REACT_FALLBACK, "react@jsdelivr");
+      // jsdelivr 的 react-dom client 子路径与 esm.sh 不同,需再 fallback
+      DomMod   = await tryImport(REACT_DOM_FALLBACK, "react-dom@jsdelivr");
+    }catch(e2){
+      __bootErr("全部 CDN 加载失败,请检查网络: " + (e2?.message || e2));
+      return;
+    }
+  }
+  // 兼容两种结构(默认导出 / 命名导出)
+  const React = ReactMod.default || ReactMod;
+  const { useState, useEffect, useMemo } = ReactMod;
+  const { createRoot } = DomMod;
+  // 注入到全局并触发渲染
+  globalThis.__ReactBootDone = { React, useState, useEffect, useMemo, createRoot };
+  globalThis.dispatchEvent(new Event("react-boot-done"));
+})();
+
+__bootLog("已发起 React 异步加载");
+
+// === 渲染逻辑全部包在 react-boot-done 事件回调里,避免顶层引用未加载的 React ===
+globalThis.addEventListener("react-boot-done", ()=>{
+  const { React, useState, useEffect, useMemo, createRoot } = globalThis.__ReactBootDone;
+  __bootLog("React 加载完成,准备渲染");
+  renderApp(React, useState, useEffect, useMemo, createRoot);
+});
+
+function renderApp(React, useState, useEffect, useMemo, createRoot){
 const h = React.createElement;
-// useState/useEffect/useMemo 已通过 import 引入
 
 /* ---------------- 工具函数 ---------------- */
 function scoreIp(entry){
@@ -876,11 +924,11 @@ function ClearDialog({open,onClose,recordName,onCleared,zoneARecordCount,hostnam
         setErr(
           (j.message||"无可清空的记录") +
           (j.allZoneANames && j.allZoneANames.length
-            ? "\n\n该 zone 下全部 A 记录的 name: " + j.allZoneANames.map((n)=>JSON.stringify(n)).join(", ")
+            ? "  该 zone 下全部 A 记录的 name: " + j.allZoneANames.map((n)=>JSON.stringify(n)).join(", ")
             : "") +
           (j.normalizedMatchedName
-            ? "\n我查找的主机名（归一化）: " + JSON.stringify(j.normalizedMatchedName) +
-              "\n如果上面对应不上，多半是 RECORD_NAME 环境变量配错（少主机名/写成了别的子域名）"
+            ? "  我查找的主机名（归一化）: " + JSON.stringify(j.normalizedMatchedName) +
+              "  如果上面对应不上，多半是 RECORD_NAME 环境变量配错（少主机名/写成了别的子域名）"
             : "")
         );
         setSubmitting(false);
@@ -1224,10 +1272,11 @@ function ConfigBanner({config,tokenExpired,tokenNearExpire,onAutoConfig,onRefres
 try{
   const root=createRoot(document.getElementById("root"));
   root.render(h(Dashboard));
-  __bootErr("[boot] ✓ 渲染完成");
+  __bootLog("渲染完成");
 }catch(e){
-  __bootErr("[render error] "+(e?.message||e)+"\n"+(e?.stack||""));
+  __bootErr("[render error] "+(e?.message||e)+"  "+(e?.stack||""));
 }
+} // === renderApp end ===
 </script>
 </body>
 </html>`;
@@ -1258,6 +1307,31 @@ export default {
     // 简单的可选鉴权（如果设置了 ADMIN_KEY）
     const needAuth = !!env.ADMIN_KEY;
     const authorized = !needAuth || url.searchParams.get("key") === env.ADMIN_KEY;
+
+    // 版本自检（用于排查白屏时确认部署的就是当前文件）
+    if (path === "/api/version" || path === "/version") {
+      const html = HTML_PAGE;
+      // 简单 hash (FNV-1a 32-bit)
+      let h = 0x811c9dc5;
+      for (let i = 0; i < html.length; i++) {
+        h ^= html.charCodeAt(i);
+        h = (h * 0x01000193) >>> 0;
+      }
+      const fnv = ("00000000" + h.toString(16)).slice(-8);
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          scriptBytes: HTML_PAGE.length,
+          scriptLines: HTML_PAGE.split(/\r?\n/).length,
+          scriptFnv32: fnv,
+          hasDynamicReactImport: HTML_PAGE.includes("REACT_PRIMARY"),
+          hasCreateRootImport: html.includes("createRoot"),
+          buildId: "2026-07-29-fix-475",
+          note: "若 scriptFnv32 与本地 worker.js 计算结果不一致,说明 Cloudflare 部署的是旧版本,请重新粘贴并 Deploy",
+        }, null, 2),
+        { headers: { "Content-Type": "application/json; charset=utf-8" } }
+      );
+    }
 
     // 静态资源：根路径 / 或 /index.html
     if (path === "/" || path === "/index.html") {

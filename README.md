@@ -6,6 +6,21 @@
 
 ---
 
+## 欢迎提出意见
+
+本项目以"小白也能 5 分钟部署"为设计目标,但 Cloudflare Workers / 华为云 IAM / DNS API / vps789 数据源等任何一环都可能变化,实际使用中难免遇到 README 没覆盖到的情况。
+
+**非常欢迎在 [GitHub Issues](../../issues) 提 issue**,包括但不限于:
+
+- 部署过程中卡在哪一步、报错截图
+- 面板某个按钮/弹窗不好用、文案看不懂
+- 想加的新功能(比如多主机记录、Telegram 通知、自定义评分公式等)
+- 文档里没说清楚的细节
+
+反馈越具体越好(贴日志/截图/你的 region 之类),我会尽量逐条回复。**嫌开 issue 麻烦的话,提 PR 直接改 README 也完全 OK。**
+
+---
+
 ## 项目简介
 
 这是一个部署在 Cloudflare Workers 上的自托管工具,用于解决以下问题:
@@ -33,7 +48,7 @@
 | Token 自动续期 | 每次同步前检查 Token 剩余有效期,小于 1 小时时自动重新换新 |
 | 可视化管理 | 面板内可手动触发同步、查看候选 IP 列表、查看 DNS A 记录、查看执行日志、清空 A 记录 |
 | 数据可观测 | 执行日志保存到 KV,面板刷新即可看到历史任务输出 |
-| 自带错误捕获 | 任何 import 失败、render 报错都会以红色错误条显示在页面顶部,避免白屏 |
+| 自带错误捕获 | 任何 import 失败、render 报错都会以红色错误条显示在页面顶部,避免白屏;正常启动日志只输出到浏览器控制台,不打扰 UI |
 | 华为云国际站兼容 | API 路径与认证方式与国内站完全一致,只换 region 即可 |
 
 ---
@@ -59,13 +74,15 @@
 ```
 [浏览器]
    |
-   |--- fetch /api/config      拉取当前配置(Token 状态、区域、项目、有效期)
-   |--- fetch /api/ips         拉取 vps789 优选 IP 数据,只读不写
-   |--- fetch /api/records     拉取 zone 下当前 A 记录
-   |--- fetch /api/sync        手动触发一次同步
-   |--- POST /api/auto-config  一键配置 IAM(账号+用户+密码+region)
+   |--- 动态 import() 加载 React (esm.sh 主源 + jsdelivr 备用)
+   |--- fetch /api/config       拉取当前配置(Token 状态、区域、项目、有效期)
+   |--- fetch /api/ips          拉取 vps789 优选 IP 数据,只读不写
+   |--- fetch /api/records      拉取 zone 下当前 A 记录
+   |--- fetch /api/sync         手动触发一次同步
+   |--- POST /api/auto-config   一键配置 IAM(账号+用户+密码+region)
    |--- POST /api/refresh-token 强制刷新 Token
    |--- POST /api/clear-records 清空 A 记录(按主机或整个 zone)
+   |--- GET  /api/version       部署指纹自检 (FNV-1a 32-bit)
    |
    v
 [Cloudflare Workers] --KV 读写--> [CF_IP_SYNC_KV]
@@ -291,6 +308,7 @@ Worker 详情 -> **Settings** -> **Variables and Secrets** -> **Add variable**:
 | POST | `/api/auto-config` | 提交华为云账号/IAM/密码/region,自动换 Token 并写 KV | 是 |
 | POST | `/api/refresh-token` | 强制刷新 Token(忽略剩余有效期) | 是 |
 | POST | `/api/clear-records` | 清空 A 记录(`scope` 可选 `hostname` / `zone`) | 是 |
+| GET | `/api/version` | 部署指纹自检 (FNV-1a 32-bit hash + 关键标识) | 否 |
 | - | Cron Trigger | 定时自动执行同步(由 Cloudflare 平台触发) | - |
 
 ### `POST /api/auto-config` 请求示例
@@ -471,9 +489,14 @@ A: 少数情况下 vps789 临时不可用,等下一次 15 分钟重试即可。�
 
 **Q: 面板白屏/加载不出来。**
 
-A: 页面顶部会自动显示红色错误条,把错误内容截图提 issue 即可。常见原因:
-- esm.sh 改版:已通过 `?pin=v135` 锁定,如仍有问题请检查网络是否能访问 `https://esm.sh`
-- 浏览器禁用了 ES module:升级到现代浏览器(Chrome 89+ / Firefox 108+ / Safari 15+)
+A: 排查步骤:
+
+1. 访问 `https://<your-worker>.workers.dev/api/version`,应该返回 JSON 包含 `scriptFnv32`、`hasDynamicReactImport: true`、`hasCreateRootImport: true`、`buildId: 2026-07-29-fix-475`。如果 `scriptFnv32` 与最新源码不一致,说明 Cloudflare 部署的是旧版本,请重新粘贴 `worker.js` 后点 **Save and Deploy**。
+2. 浏览器打开 **DevTools -> Console**,启动进度日志会出现在 `[boot] ...` 前缀下;**红色错误条**只在真正异常时才显示,正常加载时不会有。
+3. 常见原因:
+   - esm.sh 改版:已通过 `?pin=v135` 锁定,主源失败会自动回退到 jsdelivr;如仍有问题请检查网络是否能访问 `https://esm.sh` 和 `https://cdn.jsdelivr.net`
+   - 浏览器禁用了 ES module:升级到现代浏览器(Chrome 89+ / Firefox 108+ / Safari 15+)
+   - 部署了旧版本:见步骤 1,用 `/api/version` 对比指纹
 
 **Q: 担心账号密码明文存在 KV 里。**
 
